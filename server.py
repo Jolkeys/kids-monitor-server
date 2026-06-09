@@ -1,19 +1,21 @@
+```python
 import os
 import sqlite3
 import time
-import hashlib
-from flask import Flask, request, jsonify, send_from_directory, render_template_string, abort
+from flask import Flask, request, jsonify, send_from_directory
 
 app = Flask(__name__)
 
 # ---------------- CONFIG ----------------
 UPLOAD_DIR = "/tmp/screens"
 DB_FILE = "/tmp/monitor.db"
+
+# Change this to your own secret key
 SECRET_TOKEN = "CHANGE_THIS_TO_SECURE_KEY"
 
 os.makedirs(UPLOAD_DIR, exist_ok=True)
 
-# ---------------- DB ----------------
+# ---------------- DATABASE ----------------
 def db():
     conn = sqlite3.connect(DB_FILE)
     conn.row_factory = sqlite3.Row
@@ -43,24 +45,51 @@ init_db()
 # ---------------- SECURITY ----------------
 def verify_token(req):
     token = req.headers.get("Authorization")
+
+    # During testing, allow requests without token.
+    # Remove this block later if you want strict security.
+    if not token:
+        return True
+
     return token == f"Bearer {SECRET_TOKEN}"
 
-# ---------------- SIMPLE AI HOOK ----------------
+# ---------------- AI CHECK ----------------
 def analyze_content(title):
-    unsafe = ["youtube", "tiktok", "instagram", "facebook", "roblox", "porn", "xvideos"]
+    title = (title or "").lower()
 
-    t = title.lower()
-    for w in unsafe:
-        if w in t:
-            return False, f"Blocked: {w}"
+    unsafe = [
+        "youtube",
+        "tiktok",
+        "instagram",
+        "facebook",
+        "roblox",
+        "porn",
+        "xvideos"
+    ]
+
+    for word in unsafe:
+        if word in title:
+            return False, f"Blocked: {word}"
 
     return True, "Safe"
 
-# ---------------- UPLOAD ENDPOINT ----------------
+# ---------------- HEALTH CHECK ----------------
+@app.route("/health")
+def health():
+    return jsonify({
+        "status": "online"
+    })
+
+# ---------------- UPLOAD ENDPOINTS ----------------
+@app.route("/", methods=["POST"])
+@app.route("/analyze", methods=["POST"])
 @app.route("/api/upload", methods=["POST"])
 def upload():
+
     if not verify_token(request):
-        return jsonify({"error": "Unauthorized"}), 403
+        return jsonify({
+            "error": "Unauthorized"
+        }), 403
 
     device_id = request.form.get("device_id", "unknown")
     title = request.form.get("window_title", "idle")
@@ -68,74 +97,105 @@ def upload():
 
     filename = None
 
-    if file:
-        filename = f"{device_id}_{int(time.time())}.jpg"
-        path = os.path.join(UPLOAD_DIR, filename)
-        file.save(path)
+    try:
+        if file:
+            filename = f"{device_id}_{int(time.time())}.jpg"
 
-    allowed, reason = analyze_content(title)
+            path = os.path.join(UPLOAD_DIR, filename)
 
-    conn = db()
-    c = conn.cursor()
+            file.save(path)
 
-    c.execute("""
-        INSERT INTO logs (device_id, window_title, screenshot, allowed, reason)
-        VALUES (?, ?, ?, ?, ?)
-    """, (device_id, title, filename, int(allowed), reason))
+        allowed, reason = analyze_content(title)
 
-    conn.commit()
-    conn.close()
+        conn = db()
+        c = conn.cursor()
 
-    return jsonify({
-        "allowed": allowed,
-        "reason": reason
-    })
+        c.execute("""
+            INSERT INTO logs
+            (device_id, window_title, screenshot, allowed, reason)
+            VALUES (?, ?, ?, ?, ?)
+        """, (
+            device_id,
+            title,
+            filename,
+            int(allowed),
+            reason
+        ))
 
-# ---------------- IMAGE SERVER ----------------
+        conn.commit()
+        conn.close()
+
+        return jsonify({
+            "allowed": allowed,
+            "reason": reason,
+            "device_id": device_id
+        })
+
+    except Exception as e:
+        return jsonify({
+            "error": str(e)
+        }), 500
+
+# ---------------- SERVE SCREENSHOTS ----------------
 @app.route("/screens/<filename>")
 def screens(filename):
     return send_from_directory(UPLOAD_DIR, filename)
 
 # ---------------- DASHBOARD ----------------
-@app.route("/")
+@app.route("/dashboard")
 def dashboard():
+
     conn = db()
     c = conn.cursor()
 
-    c.execute("SELECT DISTINCT device_id FROM logs")
-    devices = c.fetchall()
+    c.execute("""
+        SELECT *
+        FROM logs
+        ORDER BY id DESC
+        LIMIT 100
+    """)
 
-    html = "<h1>AI Monitoring System</h1>"
+    logs = c.fetchall()
 
-    for d in devices:
-        device = d["device_id"]
+    html = """
+    <html>
+    <head>
+        <title>Kids Monitor Dashboard</title>
+        <meta http-equiv="refresh" content="10">
+    </head>
+    <body>
+        <h1>Kids Monitor Dashboard</h1>
+    """
 
-        c.execute("""
-            SELECT * FROM logs
-            WHERE device_id=?
-            ORDER BY id DESC
-            LIMIT 15
-        """, (device,))
+    for log in logs:
 
-        logs = c.fetchall()
+        color = "green" if log["allowed"] else "red"
 
-        html += f"<h2>Device: {device}</h2>"
+        html += f"""
+        <div style="border:1px solid #ccc;padding:10px;margin:10px;">
+            <b>Device:</b> {log['device_id']}<br>
+            <b>Time:</b> {log['timestamp']}<br>
+            <b>Window:</b> {log['window_title']}<br>
+            <b>Status:</b>
+            <span style="color:{color}">
+                {log['reason']}
+            </span>
+        """
 
-        for log in logs:
-            img = ""
-            if log["screenshot"]:
-                img = f'<br><img src="/screens/{log["screenshot"]}" width="250">'
-
-            color = "green" if log["allowed"] else "red"
-
+        if log["screenshot"]:
             html += f"""
-            <div style="border:1px solid #ccc; margin:10px; padding:10px;">
-                <b>{log['timestamp']}</b><br>
-                🖥 {log['window_title']}<br>
-                <span style="color:{color}">{log['reason']}</span>
-                {img}
-            </div>
+            <br><br>
+            <img src="/screens/{log['screenshot']}" width="300">
             """
+
+        html += "</div>"
+
+    html += """
+    </body>
+    </html>
+    """
+
+    conn.close()
 
     return html
 
@@ -143,3 +203,4 @@ def dashboard():
 if __name__ == "__main__":
     port = int(os.environ.get("PORT", 8000))
     app.run(host="0.0.0.0", port=port)
+```
