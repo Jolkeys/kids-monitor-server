@@ -1,179 +1,145 @@
 import os
 import sqlite3
 import time
-from flask import Flask, request, send_from_directory, render_template_string, jsonify
+import hashlib
+from flask import Flask, request, jsonify, send_from_directory, render_template_string, abort
 
 app = Flask(__name__)
 
-# Use /tmp for Render (ephemeral storage)
-STORAGE_ROOT = "/tmp"
-UPLOAD_DIR = os.path.join(STORAGE_ROOT, "captured_screens")
-DB_FILE = os.path.join(STORAGE_ROOT, "monitoring_database.sqlite")
+# ---------------- CONFIG ----------------
+UPLOAD_DIR = "/tmp/screens"
+DB_FILE = "/tmp/monitor.db"
+SECRET_TOKEN = "CHANGE_THIS_TO_SECURE_KEY"
 
 os.makedirs(UPLOAD_DIR, exist_ok=True)
 
-# -----------------------------
-# INIT DATABASE
-# -----------------------------
-def init_db():
+# ---------------- DB ----------------
+def db():
     conn = sqlite3.connect(DB_FILE)
-    cursor = conn.cursor()
-    cursor.execute("""
-        CREATE TABLE IF NOT EXISTS activity_logs (
+    conn.row_factory = sqlite3.Row
+    return conn
+
+def init_db():
+    conn = db()
+    c = conn.cursor()
+
+    c.execute("""
+        CREATE TABLE IF NOT EXISTS logs (
             id INTEGER PRIMARY KEY AUTOINCREMENT,
             device_id TEXT,
             window_title TEXT,
-            screenshot_path TEXT,
+            screenshot TEXT,
+            allowed INTEGER,
+            reason TEXT,
             timestamp DATETIME DEFAULT CURRENT_TIMESTAMP
         )
     """)
+
     conn.commit()
     conn.close()
 
 init_db()
 
-# -----------------------------
-# AI ANALYSIS PLACEHOLDER
-# -----------------------------
-def analyze_image(file_path, window_title):
-    """
-    THIS is where AI will go later.
-    For now we simulate detection rules.
-    """
+# ---------------- SECURITY ----------------
+def verify_token(req):
+    token = req.headers.get("Authorization")
+    return token == f"Bearer {SECRET_TOKEN}"
 
-    unsafe_keywords = [
-        "youtube", "tiktok", "instagram", "facebook",
-        "game", "roblox", "porn", "xvideos"
-    ]
+# ---------------- SIMPLE AI HOOK ----------------
+def analyze_content(title):
+    unsafe = ["youtube", "tiktok", "instagram", "facebook", "roblox", "porn", "xvideos"]
 
-    title_lower = window_title.lower()
+    t = title.lower()
+    for w in unsafe:
+        if w in t:
+            return False, f"Blocked: {w}"
 
-    for word in unsafe_keywords:
-        if word in title_lower:
-            return False, f"Blocked keyword detected: {word}"
+    return True, "Safe"
 
-    return True, "Safe activity"
+# ---------------- UPLOAD ENDPOINT ----------------
+@app.route("/api/upload", methods=["POST"])
+def upload():
+    if not verify_token(request):
+        return jsonify({"error": "Unauthorized"}), 403
 
-
-# -----------------------------
-# CLIENT UPLOAD + AI RESPONSE ENDPOINT
-# -----------------------------
-@app.route('/analyze', methods=['POST'])
-def analyze():
-    device_id = request.form.get("device_id", "Unknown_Laptop")
-    window_title = request.form.get("window_title", "Desktop / Idle")
+    device_id = request.form.get("device_id", "unknown")
+    title = request.form.get("window_title", "idle")
     file = request.files.get("screenshot")
 
-    screenshot_path = ""
+    filename = None
 
     if file:
         filename = f"{device_id}_{int(time.time())}.jpg"
-        screenshot_path = os.path.join(UPLOAD_DIR, filename)
-        file.save(screenshot_path)
+        path = os.path.join(UPLOAD_DIR, filename)
+        file.save(path)
 
-    # Run AI analysis (currently rule-based)
-    allowed, reason = analyze_image(screenshot_path, window_title)
+    allowed, reason = analyze_content(title)
 
-    # Save log
-    conn = sqlite3.connect(DB_FILE)
-    cursor = conn.cursor()
-    cursor.execute("""
-        INSERT INTO activity_logs (device_id, window_title, screenshot_path)
-        VALUES (?, ?, ?)
-    """, (device_id, window_title, screenshot_path))
+    conn = db()
+    c = conn.cursor()
+
+    c.execute("""
+        INSERT INTO logs (device_id, window_title, screenshot, allowed, reason)
+        VALUES (?, ?, ?, ?, ?)
+    """, (device_id, title, filename, int(allowed), reason))
+
     conn.commit()
     conn.close()
 
-    # Return decision to client
     return jsonify({
         "allowed": allowed,
         "reason": reason
-    }), 200
+    })
 
-
-# -----------------------------
-# IMAGE SERVER
-# -----------------------------
-@app.route('/tmp/captured_screens/<filename>')
-def serve_image(filename):
+# ---------------- IMAGE SERVER ----------------
+@app.route("/screens/<filename>")
+def screens(filename):
     return send_from_directory(UPLOAD_DIR, filename)
 
-
-# -----------------------------
-# DASHBOARD
-# -----------------------------
-@app.route('/', methods=['GET'])
+# ---------------- DASHBOARD ----------------
+@app.route("/")
 def dashboard():
-    conn = sqlite3.connect(DB_FILE)
-    cursor = conn.cursor()
+    conn = db()
+    c = conn.cursor()
 
-    cursor.execute("SELECT DISTINCT device_id FROM activity_logs")
-    devices = cursor.fetchall()
+    c.execute("SELECT DISTINCT device_id FROM logs")
+    devices = c.fetchall()
 
-    grid_html = ""
+    html = "<h1>AI Monitoring System</h1>"
 
-    for dev in devices:
-        device_id = dev[0]
+    for d in devices:
+        device = d["device_id"]
 
-        cursor.execute("""
-            SELECT window_title, screenshot_path, timestamp
-            FROM activity_logs
-            WHERE device_id = ?
-            ORDER BY timestamp DESC
-            LIMIT 10
-        """, (device_id,))
+        c.execute("""
+            SELECT * FROM logs
+            WHERE device_id=?
+            ORDER BY id DESC
+            LIMIT 15
+        """, (device,))
 
-        logs = cursor.fetchall()
+        logs = c.fetchall()
 
-        log_entries_html = ""
+        html += f"<h2>Device: {device}</h2>"
 
         for log in logs:
-            win_title, img_path, ts = log
+            img = ""
+            if log["screenshot"]:
+                img = f'<br><img src="/screens/{log["screenshot"]}" width="250">'
 
-            filename = os.path.basename(img_path) if img_path else ""
+            color = "green" if log["allowed"] else "red"
 
-            img_tag = ""
-            if filename:
-                img_tag = f'<img src="/tmp/captured_screens/{filename}" width="250">'
-
-            log_entries_html += f"""
-                <div style="border:1px solid #ddd; padding:10px; margin:10px;">
-                    <div>🕒 {ts}</div>
-                    <div>🖥️ {win_title}</div>
-                    {img_tag}
-                </div>
+            html += f"""
+            <div style="border:1px solid #ccc; margin:10px; padding:10px;">
+                <b>{log['timestamp']}</b><br>
+                🖥 {log['window_title']}<br>
+                <span style="color:{color}">{log['reason']}</span>
+                {img}
+            </div>
             """
 
-        grid_html += f"""
-        <div style="border:2px solid black; padding:10px; margin:10px;">
-            <h3>💻 {device_id}</h3>
-            {log_entries_html}
-        </div>
-        """
+    return html
 
-    conn.close()
-
-    html = f"""
-    <html>
-    <head>
-        <meta http-equiv="refresh" content="10">
-        <title>Monitor Dashboard</title>
-    </head>
-    <body>
-        <h1>AI Monitoring Dashboard</h1>
-        <div style="display:flex; flex-wrap:wrap;">
-            {grid_html}
-        </div>
-    </body>
-    </html>
-    """
-
-    return render_template_string(html)
-
-
-# -----------------------------
-# RUN SERVER
-# -----------------------------
+# ---------------- RUN ----------------
 if __name__ == "__main__":
     port = int(os.environ.get("PORT", 8000))
     app.run(host="0.0.0.0", port=port)
