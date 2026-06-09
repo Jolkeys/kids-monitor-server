@@ -1,0 +1,7 @@
+flask
+gunicorn
+pyautogui
+google-generativeai
+psutil
+requests
+pillow
