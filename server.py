@@ -100,7 +100,7 @@ def dashboard():
     <html>
     <head>
         <meta charset="UTF-8">
-        <title>Multi-Laptop Control Dashboard</title>
+        <title>Sigei's-Laptop Control Dashboard</title>
         <meta http-equiv="refresh" content="10">
         <style>
             body {{ font-family: 'Segoe UI', Arial, sans-serif; background: #f3f4f6; margin: 30px; color: #333; }}
